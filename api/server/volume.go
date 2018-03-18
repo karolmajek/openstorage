@@ -3,12 +3,14 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/gorilla/mux"
 	"github.com/libopenstorage/openstorage/api"
+	"github.com/libopenstorage/openstorage/api/client/cluster"
 	"github.com/libopenstorage/openstorage/api/errors"
 	"github.com/libopenstorage/openstorage/volume"
 	"github.com/libopenstorage/openstorage/volume/drivers"
@@ -66,6 +68,46 @@ func (vd *volAPI) parseID(r *http.Request) (string, error) {
 	return "", fmt.Errorf("could not parse snap ID")
 }
 
+func (vd *volAPI) replicaIPtoIds(r *http.Request, nodes []string) ([]string, error) {
+	nodeIds := make([]string, 0)
+	_, port, err := net.SplitHostPort(r.Host)
+	if err == nil {
+		clnt, err := cluster.NewClusterClient("http://127.0.0.1:"+port, "")
+		if err != nil {
+			return nodeIds, err
+		}
+
+		manager := cluster.ClusterManager(clnt)
+
+		for _, idIp := range nodes {
+			if idIp != "" {
+				id, err := manager.GetNodeIdFromIp(idIp)
+				if err != nil {
+					return nodeIds, err
+				}
+				nodeIds = append(nodeIds, id)
+			}
+		}
+	}
+
+	return nodeIds, err
+}
+
+func (vd *volAPI) replicaSpecIPtoIds(r *http.Request, rspecRef *api.ReplicaSet) error {
+	if rspecRef != nil && len(rspecRef.Nodes) > 0 {
+		nodeIds, err := vd.replicaIPtoIds(r, rspecRef.Nodes)
+		if err != nil {
+			return err
+		}
+
+		if len(nodeIds) > 0 {
+			rspecRef.Nodes = nodeIds
+		}
+	}
+
+	return nil
+}
+
 // swagger:operation POST /osd-volumes volume createVolume
 //
 // Creates a single volume with given spec.
@@ -105,6 +147,12 @@ func (vd *volAPI) create(w http.ResponseWriter, r *http.Request) {
 		notFound(w, r)
 		return
 	}
+
+	if err = vd.replicaSpecIPtoIds(r, dcReq.Spec.ReplicaSet); err != nil {
+		vd.sendError(vd.name, method, w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	id, err := d.Create(dcReq.Locator, dcReq.Source, dcReq.Spec)
 	dcRes.VolumeResponse = &api.VolumeResponse{Error: responseStatus(err)}
 	dcRes.Id = id
@@ -199,6 +247,10 @@ func (vd *volAPI) volumeSet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Locator != nil || req.Spec != nil {
+		if err = vd.replicaSpecIPtoIds(r, req.Spec.ReplicaSet); err != nil {
+			vd.sendError(vd.name, method, w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		err = d.Set(volumeID, req.Locator, req.Spec)
 	}
 
